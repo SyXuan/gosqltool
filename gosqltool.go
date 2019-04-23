@@ -7,8 +7,14 @@ import (
 	"github.com/beevik/etree"
 )
 
+// XML default table name and row name
+var (
+	TableName = "RowData"
+	RowName   = "Row_"
+)
+
 // RowsToMap transfer sql res to map
-// dataMap[rowCnt][colName]
+// dataMap[rowCnt]map[colName]value
 func RowsToMap(rows *sql.Rows) (dataRes map[int]map[string]string, err error) {
 	dataMap := make(map[int]map[string]string)
 	cols, err := rows.Columns()
@@ -24,7 +30,6 @@ func RowsToMap(rows *sql.Rows) (dataRes map[int]map[string]string, err error) {
 	}
 
 	rowCnt := 0
-
 	for rows.Next() {
 		rowMap := make(map[string]string)
 		err = rows.Scan(dest...)
@@ -55,7 +60,7 @@ func RowsToMap(rows *sql.Rows) (dataRes map[int]map[string]string, err error) {
 //         <[KEY2]>[VALUE2]</[KEY2]>
 //     </[rowName]0>
 // </[tableName]>
-func RowsToXML(rows *sql.Rows, tableName, rowName string) (xmlString string, err error) {
+func RowsToXML(rows *sql.Rows) (xmlString string, err error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return
@@ -70,26 +75,15 @@ func RowsToXML(rows *sql.Rows, tableName, rowName string) (xmlString string, err
 
 	xml := etree.NewDocument()
 	xml.CreateProcInst("xml", `version="1.0" encoding="UTF-8"`)
-	var tn = "RowData"
-	var rn = "Row_"
-	if len(tableName) > 0 {
-		tn = tableName
-	}
-	if len(rowName) > 0 {
-		rn = rowName
-	}
-	rowData := xml.CreateElement(tn)
-
+	rowData := xml.CreateElement(TableName)
 	rowCnt := 0
-
 	for rows.Next() {
 		err = rows.Scan(dest...)
 		if err != nil {
 			return
 		}
 
-		rowElement := rowData.CreateElement(fmt.Sprintf("%s%d", rn, rowCnt))
-
+		rowElement := rowData.CreateElement(fmt.Sprintf("%s%d", RowName, rowCnt))
 		for i, raw := range rawResult {
 			colName := rowElement.CreateElement(cols[i])
 			colName.CreateText(string(raw))

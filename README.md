@@ -12,7 +12,7 @@ go get github.com/syxuan/gosqltool
 ## Example
 ### RowsToMap
 ```go
-    rows, err = db.Query("SELECT * FROM userinfo")
+    rows, err := db.Query("SELECT * FROM userinfo")
     defer rows.Close()
     checkErr(err)
     
@@ -31,7 +31,7 @@ And that you can easily get the value via map, such as
 ### RowsToXML
 XML is a very simple way to send data for web api or for windows executable dll files.
 ```go
-    rows, err = db.Query("SELECT * FROM userinfo")
+    rows, err := db.Query("SELECT * FROM userinfo")
     defer rows.Close()
     checkErr(err)
 
@@ -66,7 +66,7 @@ The output will be
 
 Or you can custom the TableName and RowName
 ```go
-    rows, err = db.Query("SELECT * FROM userinfo")
+    rows, err := db.Query("SELECT * FROM userinfo")
     defer rows.Close()
     checkErr(err)
 

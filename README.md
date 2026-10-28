@@ -17,14 +17,68 @@ Requires Go 1.23 or later.
 | --- | --- | --- |
 | `RowsToMap(rows)` | `map[int]map[string]string` | Original API, keys are 0-based row indexes. NULL becomes `""`. |
 | `RowsToSlice(rows)` | `[]map[string]string` | Same string values as `RowsToMap`, but in row order. Prefer this for new code. |
-| `RowsToAny(rows)` | `[]map[string]any` | Keeps driver types where possible (int64, float64, bool, time.Time, …). NULL is `nil`, not `""`. Which type a column gets depends on the driver: a MySQL driver returning `[]byte` for numbers still yields strings. |
+| `RowsToAny(rows)` | `[]map[string]any` | Keeps driver types where possible (int64, float64, bool, time.Time, …). NULL is `nil`, not `""`. A value that arrives as `[]byte` or string is converted using the column's database type (see Typed conversion below), so a MySQL INT column no longer yields a string. |
 | `RowsToJSON(rows)` | JSON array string | Built on `RowsToAny`: numbers stay numbers, NULL is `null`, times are RFC3339Nano. Empty result is `"[]"`. A value JSON cannot encode (NaN, infinite float) makes the call fail instead of producing invalid JSON. |
 | `RowsToXML(rows)` | XML string | Original API. Table/row names come from the `TableName` / `RowName` variables. |
 | `RowsToXMLWithNames(rows, table, row)` | XML string | Same as `RowsToXML`, but the names are parameters instead of globals. Empty names fall back to the defaults. |
+| `IterAny(rows)` | `iter.Seq2[map[string]any, error]` | Streams one typed row at a time, same values as `RowsToAny`, without loading the whole result. |
+| `IterString(rows)` | `iter.Seq2[map[string]string, error]` | Streams one string row at a time, same values as `RowsToSlice`. |
+| `ForEachAny(rows, fn)` / `ForEachString(rows, fn)` | `error` | Calls `fn` once per row and stops at the first error from `fn` or from iteration. |
+| `WriteJSON(w, rows)` | `error` | Streams rows to `w` as a JSON array, one row at a time. Empty result writes `"[]"`. |
+| `WriteXML(w, rows, table, row)` | `error` | Streams rows to `w` as XML, one row at a time, preserving duplicate column names and order. Empty names fall back to the defaults. |
 
 On any read error, the functions return `nil` / `""` plus the error
 (including errors reported by `rows.Err()` after iteration) instead of
 a partial result. Passing `nil` rows returns an error.
+
+## Streaming
+
+The collecting APIs above load the whole result into memory. For a
+large result, iterate or write one row at a time instead:
+
+```go
+for row, err := range gosqltool.IterAny(rows) {
+    if err != nil {
+        checkErr(err)
+    }
+    fmt.Println(row["username"])
+}
+```
+
+Or use the callback form, or stream straight to a writer (for
+example an HTTP response):
+
+```go
+err := gosqltool.WriteJSON(w, rows)
+checkErr(err)
+```
+
+Streaming APIs do not close `rows`: the caller still owns it and
+must close it, exactly as with the collecting APIs. Breaking out of
+an iterator early simply stops iteration, with no error. Unlike the
+collecting APIs, `WriteJSON` / `WriteXML` cannot take back output
+already written, so a mid-stream read or encode error leaves a
+partial array or document in the writer; the error is still returned.
+
+## Typed conversion
+
+`RowsToAny`, `IterAny`, `ForEachAny`, `RowsToJSON` and `WriteJSON`
+convert a `[]byte` or string value using the column's database type
+(`rows.ColumnTypes()`), covering common MySQL, PostgreSQL and SQLite
+spellings:
+
+- INT-like columns yield `int64`
+- FLOAT / DOUBLE / REAL / DECIMAL / NUMERIC yield `float64`
+- BOOL / BOOLEAN yield `bool`
+- DATE / DATETIME / TIMESTAMP yield `time.Time`
+
+Values the driver already typed pass through unchanged. A value that
+cannot be parsed for its column type falls back to its string form
+instead of failing the row. DECIMAL and NUMERIC become `float64`, so
+very large or high-precision decimals may lose precision. TIME
+columns stay strings, because a time of day has no date to put into
+a `time.Time`. Columns whose type the driver does not report keep
+the previous behaviour (`[]byte` becomes a string).
 
 ## Example
 
@@ -137,6 +191,15 @@ set them once at startup if you use them, or prefer
 
 ## Migration notes
 
+- **Typed conversion (new in this change):** `RowsToAny` and
+  `RowsToJSON` used to keep a `[]byte` value as a string whenever
+  the driver returned it that way (for example a MySQL INT column
+  yielded `"42"`). They now convert it using the column's database
+  type, so the same column yields `int64(42)`. This is the intended
+  fix, but it changes output for drivers that return numbers, bools
+  or times as `[]byte` or strings. Columns with no reported type,
+  unparsable values (which fall back to strings), and values the
+  driver already typed are unchanged.
 - The module path is now `github.com/SyXuan/gosqltool` (capital `S`/`X`,
   matching the repository). The old README showed a lowercase path.
 - `RowsToMap` and `RowsToXML` keep their original signatures and, for

@@ -228,6 +228,54 @@ func TestRowsToXMLSanitizesNamesAndEscapesValues(t *testing.T) {
 	}
 }
 
+func TestRowsToXMLPreservesDuplicateColumns(t *testing.T) {
+	// Duplicate columns must keep both values in order, as the legacy
+	// streaming implementation did. A map-based XML path would output
+	// <a>2</a><a>2</a> here instead.
+	rows := openRows(t,
+		[]string{"a", "a"},
+		[][]driver.Value{{[]byte("1"), []byte("2")}})
+	got, err := RowsToXML(rows)
+	if err != nil {
+		t.Fatalf("RowsToXML: %v", err)
+	}
+	// Indentation puts whitespace between elements, so check both
+	// elements in order rather than as one contiguous string.
+	first := strings.Index(got, "<a>1</a>")
+	second := strings.Index(got, "<a>2</a>")
+	if first < 0 || second < 0 || first >= second {
+		t.Fatalf("duplicate-column XML = %q, want <a>1</a> before <a>2</a>", got)
+	}
+
+	// The map APIs cannot represent duplicates, so they keep the last
+	// value; that behaviour is documented, not a bug.
+	rows = openRows(t,
+		[]string{"a", "a"},
+		[][]driver.Value{{[]byte("1"), []byte("2")}})
+	m, err := RowsToMap(rows)
+	if err != nil {
+		t.Fatalf("RowsToMap: %v", err)
+	}
+	if m[0]["a"] != "2" {
+		t.Fatalf("duplicate-column map = %#v, want last value \"2\"", m[0])
+	}
+}
+
+func TestRowsToXMLKeepsNonASCIIColumnNames(t *testing.T) {
+	rows := openRows(t,
+		[]string{"姓名", "地址", "café"},
+		[][]driver.Value{{[]byte("王"), []byte("台北"), []byte("x")}})
+	got, err := RowsToXML(rows)
+	if err != nil {
+		t.Fatalf("RowsToXML: %v", err)
+	}
+	for _, want := range []string{"<姓名>王</姓名>", "<地址>台北</地址>", "<café>x</café>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("XML %q does not contain %q", got, want)
+		}
+	}
+}
+
 func TestRowsErrorIsPropagated(t *testing.T) {
 	boom := errors.New("boom")
 	rows := openRowsWithErr(t,
@@ -253,6 +301,12 @@ func TestNilRowsAndEmptyResult(t *testing.T) {
 	if _, err := RowsToJSON(nil); err == nil {
 		t.Fatal("RowsToJSON(nil): want error")
 	}
+	if _, err := RowsToSlice(nil); err == nil {
+		t.Fatal("RowsToSlice(nil): want error")
+	}
+	if _, err := RowsToAny(nil); err == nil {
+		t.Fatal("RowsToAny(nil): want error")
+	}
 
 	rows := openRows(t, []string{"uid"}, nil)
 	slice, err := RowsToSlice(rows)
@@ -277,6 +331,9 @@ func TestSanitizeXMLName(t *testing.T) {
 		"2fa":       "_2fa",
 		"a-b.c":     "a-b.c",
 		"a/b":       "a_b",
+		"姓名":        "姓名",
+		"café":      "café",
+		"a:b":       "a_b",
 	}
 	for in, want := range cases {
 		if got := sanitizeXMLName(in); got != want {

@@ -3,8 +3,14 @@ package gosqltool
 import (
 	"database/sql"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
+	"iter"
+	"math"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/beevik/etree"
@@ -33,42 +39,315 @@ type stringCell struct {
 	value string
 }
 
-// scanStringCells reads rows into ordered per-row cells. NULL becomes an
-// empty string, matching the legacy RowsToMap behaviour; use RowsToAny
-// when NULL must stay distinguishable.
-func scanStringCells(rows *sql.Rows) ([]string, [][]stringCell, error) {
-	if rows == nil {
-		return nil, nil, fmt.Errorf("gosqltool: nil rows")
-	}
+// valueKind is the column type category used to convert a driver value
+// that arrived as []byte or string into a typed Go value. kindUnknown
+// means the driver gave no usable database type name, and the value is
+// left as the driver returned it ([]byte becomes string, as before).
+type valueKind int
 
+const (
+	kindUnknown valueKind = iota
+	kindInt
+	kindFloat
+	kindBool
+	kindTime
+)
+
+// columnInfo pairs a column name with its converted-value kind.
+type columnInfo struct {
+	name string
+	kind valueKind
+}
+
+// normalizeTypeName upper-cases a database type name, strips any
+// size suffix, and strips an UNSIGNED modifier in either position,
+// so "varchar(255)", "VARCHAR", "INT UNSIGNED" and "UNSIGNED INT"
+// all map the same way. "UNSIGNED BIG INT" becomes "BIG INT".
+func normalizeTypeName(name string) string {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if i := strings.IndexByte(name, '('); i >= 0 {
+		name = strings.TrimSpace(name[:i])
+	}
+	name = strings.TrimSpace(strings.TrimPrefix(name, "UNSIGNED "))
+	name = strings.TrimSpace(strings.TrimSuffix(name, " UNSIGNED"))
+	return name
+}
+
+// kindFromTypeName maps a database type name to a value kind. It covers
+// the common MySQL, PostgreSQL and SQLite spellings; anything else is
+// kindUnknown, which preserves the previous behaviour. TIME columns
+// are deliberately not kindTime: a time of day has no date, so keeping
+// it as a string avoids inventing a "0000-01-01" date in JSON output.
+func kindFromTypeName(name string) valueKind {
+	switch normalizeTypeName(name) {
+	case "INT", "INTEGER", "TINYINT", "SMALLINT", "MEDIUMINT", "BIGINT",
+		"INT1", "INT2", "INT4", "INT8", "SERIAL", "SMALLSERIAL", "BIGSERIAL", "YEAR",
+		"BIG INT", "SMALL INT", "MEDIUM INT":
+		return kindInt
+	case "FLOAT", "DOUBLE", "REAL", "DECIMAL", "NUMERIC", "MONEY",
+		"FLOAT4", "FLOAT8", "DEC", "FIXED":
+		return kindFloat
+	case "BOOL", "BOOLEAN":
+		return kindBool
+	case "DATE", "DATETIME", "TIMESTAMP", "TIMESTAMPTZ":
+		return kindTime
+	}
+	// PostgreSQL spells some types with spaces, and "DOUBLE PRECISION"
+	// is a float. TIMESTAMP WITH/WITHOUT TIME ZONE starts with TIMESTAMP.
+	norm := normalizeTypeName(name)
+	if strings.HasPrefix(norm, "TIMESTAMP") {
+		return kindTime
+	}
+	if strings.HasPrefix(norm, "DOUBLE") {
+		return kindFloat
+	}
+	return kindUnknown
+}
+
+// columnInfos returns one columnInfo per column. It returns an error
+// for nil rows, for a Columns() error, for a ColumnTypes() error, and
+// for a query with no columns, matching the error behaviour of the
+// collecting APIs.
+func columnInfos(rows *sql.Rows) ([]columnInfo, error) {
+	if rows == nil {
+		return nil, fmt.Errorf("gosqltool: nil rows")
+	}
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, nil, fmt.Errorf("gosqltool: columns: %w", err)
+		return nil, fmt.Errorf("gosqltool: columns: %w", err)
 	}
 	if len(cols) == 0 {
-		return nil, nil, fmt.Errorf("gosqltool: query returned no columns")
+		return nil, fmt.Errorf("gosqltool: query returned no columns")
 	}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("gosqltool: column types: %w", err)
+	}
+	infos := make([]columnInfo, len(cols))
+	for i, name := range cols {
+		kind := kindUnknown
+		if i < len(types) && types[i] != nil {
+			kind = kindFromTypeName(types[i].DatabaseTypeName())
+		}
+		infos[i] = columnInfo{name: name, kind: kind}
+	}
+	return infos, nil
+}
 
+// asString returns the string form of a driver value that arrived as
+// []byte or string, and whether it did.
+func asString(v any) (string, bool) {
+	switch t := v.(type) {
+	case []byte:
+		return string(t), true
+	case string:
+		return t, true
+	}
+	return "", false
+}
+
+var timeLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02T15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z0700",
+	"2006-01-02T15:04:05.999999999Z0700",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02T15:04:05.999999999Z07",
+	"2006-01-02T15:04:05.999999999",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+	"2006-01-02",
+}
+
+// convertTypedValue converts one driver value using its column kind.
+// Values the driver already typed are normalized to the column kind:
+// int becomes int64 for INT columns, int64 becomes float64 for FLOAT
+// columns, and int64/float64 become bool for BOOL columns. A []byte
+// or string value that cannot be parsed for its kind falls back to
+// its string form instead of failing the whole row, so a stray
+// non-numeric value in an INT column does not lose the rest of the
+// result. NULL (nil) stays nil. Time strings without a timezone are
+// read as UTC, so their JSON form carries a Z that the source value
+// did not have.
+func convertTypedValue(v any, kind valueKind) any {
+	if v == nil {
+		return nil
+	}
+	switch kind {
+	case kindInt:
+		switch t := v.(type) {
+		case int64:
+			return t
+		case int:
+			return int64(t)
+		case float64:
+			if t == float64(int64(t)) {
+				return int64(t)
+			}
+			return t
+		}
+		if s, ok := asString(v); ok {
+			if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+				return n
+			}
+			return s
+		}
+		return v
+	case kindFloat:
+		switch t := v.(type) {
+		case float64:
+			return t
+		case int64:
+			return float64(t)
+		case int:
+			return float64(t)
+		}
+		if s, ok := asString(v); ok {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+				// ParseFloat accepts "NaN" and "Inf", but a NaN or
+				// infinite float would make json.Marshal fail the
+				// whole JSON call, so fall back to the string form,
+				// exactly as for an unparsable value.
+				if math.IsNaN(f) || math.IsInf(f, 0) {
+					return s
+				}
+				return f
+			}
+			return s
+		}
+		return v
+	case kindBool:
+		switch t := v.(type) {
+		case bool:
+			return t
+		case int64:
+			return t != 0
+		case int:
+			return t != 0
+		case float64:
+			return t != 0
+		}
+		if s, ok := asString(v); ok {
+			switch strings.ToLower(strings.TrimSpace(s)) {
+			case "1", "t", "true", "y", "yes", "on":
+				return true
+			case "0", "f", "false", "n", "no", "off":
+				return false
+			}
+			return s
+		}
+		return v
+	case kindTime:
+		if t, ok := v.(time.Time); ok {
+			return t
+		}
+		if s, ok := asString(v); ok {
+			s = strings.TrimSpace(s)
+			for _, layout := range timeLayouts {
+				if t, err := time.Parse(layout, s); err == nil {
+					return t
+				}
+			}
+			return s
+		}
+		return v
+	default:
+		if b, ok := v.([]byte); ok {
+			return string(b)
+		}
+		return v
+	}
+}
+
+// stringColumnNames returns the column names for the string path.
+// Unlike columnInfos, it deliberately does not call ColumnTypes():
+// the string path needs only names, so a driver whose ColumnTypes()
+// fails must not break RowsToMap, RowsToSlice or RowsToXML.
+func stringColumnNames(rows *sql.Rows) ([]string, error) {
+	if rows == nil {
+		return nil, fmt.Errorf("gosqltool: nil rows")
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("gosqltool: columns: %w", err)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("gosqltool: query returned no columns")
+	}
+	return cols, nil
+}
+
+// iterateCells is the loop behind iterCells, taking precomputed
+// column names so scanStringCells does not have to fetch them twice.
+func iterateCells(rows *sql.Rows, cols []string, yield func([]stringCell, error) bool) {
 	rawResult := make([][]byte, len(cols))
 	dest := make([]any, len(cols))
 	for i := range rawResult {
 		dest[i] = &rawResult[i]
 	}
-
-	out := make([][]stringCell, 0)
 	for rows.Next() {
-		cells := make([]stringCell, len(cols))
 		if err := rows.Scan(dest...); err != nil {
-			return nil, nil, fmt.Errorf("gosqltool: scan: %w", err)
+			yield(nil, fmt.Errorf("gosqltool: scan: %w", err))
+			return
 		}
+		cells := make([]stringCell, len(cols))
 		for i, raw := range rawResult {
 			// A nil raw value means NULL; the legacy behaviour is an empty string.
+			// string(raw) copies, so the next Scan cannot overwrite this row.
 			cells[i] = stringCell{name: cols[i], value: string(raw)}
 		}
-		out = append(out, cells)
+		if !yield(cells, nil) {
+			return
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("gosqltool: rows: %w", err)
+		yield(nil, fmt.Errorf("gosqltool: rows: %w", err))
+	}
+}
+
+// iterCells yields one []stringCell per row, in query order, without
+// accumulating the whole result. NULL becomes an empty string,
+// matching the legacy RowsToMap behaviour. The iterator does not
+// close rows: the caller owns rows and must close them, exactly as
+// with the collecting APIs. Breaking out of the range early simply
+// stops iteration; no error is yielded for the break itself. A nil
+// rows value, a no-column query, a scan error, or a rows.Err() error
+// is yielded once as (nil, err) and iteration stops. The iterator
+// is single-pass: ranging it again continues from where the previous
+// range stopped, it does not restart, and two iterators must not be
+// used on the same rows concurrently.
+func iterCells(rows *sql.Rows) iter.Seq2[[]stringCell, error] {
+	return func(yield func([]stringCell, error) bool) {
+		cols, err := stringColumnNames(rows)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		iterateCells(rows, cols, yield)
+	}
+}
+
+// scanStringCells reads rows into ordered per-row cells. NULL becomes an
+// empty string, matching the legacy RowsToMap behaviour; use RowsToAny
+// when NULL must stay distinguishable.
+func scanStringCells(rows *sql.Rows) ([]string, [][]stringCell, error) {
+	cols, err := stringColumnNames(rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make([][]stringCell, 0)
+	var scanErr error
+	iterateCells(rows, cols, func(cells []stringCell, err error) bool {
+		if err != nil {
+			scanErr = err
+			return false
+		}
+		out = append(out, cells)
+		return true
+	})
+	if scanErr != nil {
+		return nil, nil, scanErr
 	}
 	return cols, out, nil
 }
@@ -93,45 +372,116 @@ func stringRows(rows *sql.Rows) ([]string, []map[string]string, error) {
 	return cols, out, nil
 }
 
-// anyRows reads rows into an ordered slice of map[colName]value.
-// Driver types are preserved where possible (int64, float64, bool,
-// time.Time, ...); []byte is converted to string so JSON encoding does not
-// turn it into base64, and NULL becomes nil.
-func anyRows(rows *sql.Rows) ([]map[string]any, error) {
-	if rows == nil {
-		return nil, fmt.Errorf("gosqltool: nil rows")
-	}
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("gosqltool: columns: %w", err)
-	}
-	if len(cols) == 0 {
-		return nil, fmt.Errorf("gosqltool: query returned no columns")
-	}
-
-	vals := make([]any, len(cols))
-	dest := make([]any, len(cols))
-	for i := range vals {
-		dest[i] = &vals[i]
-	}
-	out := make([]map[string]any, 0)
-	for rows.Next() {
-		rowMap := make(map[string]any, len(cols))
-		if err := rows.Scan(dest...); err != nil {
-			return nil, fmt.Errorf("gosqltool: scan: %w", err)
-		}
-		for i, v := range vals {
-			if b, ok := v.([]byte); ok {
-				rowMap[cols[i]] = string(b)
-			} else {
-				rowMap[cols[i]] = v
+// IterString yields one map[string]string per row, in query order,
+// without accumulating the whole result. NULL becomes an empty
+// string, duplicate column names collapse with last value wins, and
+// the iterator does not close rows; see iterCells for the exact
+// ownership, single-pass and error behaviour.
+func IterString(rows *sql.Rows) iter.Seq2[map[string]string, error] {
+	return func(yield func(map[string]string, error) bool) {
+		for cells, err := range iterCells(rows) {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			rowMap := make(map[string]string, len(cells))
+			for _, cell := range cells {
+				rowMap[cell.name] = cell.value
+			}
+			if !yield(rowMap, nil) {
+				return
 			}
 		}
-		out = append(out, rowMap)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("gosqltool: rows: %w", err)
+}
+
+// IterAny yields one map[string]any per row, in query order, without
+// accumulating the whole result. Values follow the RowsToAny rules:
+// driver types are normalized to the column kind where possible, and
+// []byte or string values are converted using the column's database
+// type (see kindFromTypeName), so a MySQL INT column that arrives as
+// []byte yields int64 instead of a string. NULL becomes nil, and
+// duplicate column names collapse with last value wins. The iterator
+// does not close rows; see iterCells for the exact ownership,
+// single-pass and error behaviour.
+func IterAny(rows *sql.Rows) iter.Seq2[map[string]any, error] {
+	return func(yield func(map[string]any, error) bool) {
+		infos, err := columnInfos(rows)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		vals := make([]any, len(infos))
+		dest := make([]any, len(infos))
+		for i := range vals {
+			dest[i] = &vals[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(dest...); err != nil {
+				yield(nil, fmt.Errorf("gosqltool: scan: %w", err))
+				return
+			}
+			rowMap := make(map[string]any, len(infos))
+			for i, info := range infos {
+				rowMap[info.name] = convertTypedValue(vals[i], info.kind)
+			}
+			if !yield(rowMap, nil) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			yield(nil, fmt.Errorf("gosqltool: rows: %w", err))
+		}
+	}
+}
+
+// ForEachAny calls fn once per row, in query order, and stops at the
+// first error from fn or from iteration. It does not close rows.
+// A nil fn returns an error instead of panicking on the first row.
+func ForEachAny(rows *sql.Rows, fn func(map[string]any) error) error {
+	if fn == nil {
+		return fmt.Errorf("gosqltool: nil func")
+	}
+	for row, err := range IterAny(rows) {
+		if err != nil {
+			return err
+		}
+		if err := fn(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ForEachString calls fn once per row, in query order, and stops at
+// the first error from fn or from iteration. It does not close rows.
+// A nil fn returns an error instead of panicking on the first row.
+func ForEachString(rows *sql.Rows, fn func(map[string]string) error) error {
+	if fn == nil {
+		return fmt.Errorf("gosqltool: nil func")
+	}
+	for row, err := range IterString(rows) {
+		if err != nil {
+			return err
+		}
+		if err := fn(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// anyRows reads rows into an ordered slice of map[colName]value.
+// Values follow the IterAny rules: driver types are kept where
+// possible, []byte or string values are converted using the column's
+// database type, and NULL becomes nil.
+func anyRows(rows *sql.Rows) ([]map[string]any, error) {
+	out := make([]map[string]any, 0)
+	for row, err := range IterAny(rows) {
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -140,9 +490,8 @@ func anyRows(rows *sql.Rows) ([]map[string]any, error) {
 // dataMap[rowCnt]map[colName]value, with rowCnt numbered from 0.
 // On a read error it returns nil and the error, not a partial result.
 // NULL becomes an empty string. Duplicate column names collapse in the
-// map, last value wins; non-string driver values are converted through
-// database/sql's []byte conversion, so for exact numeric values use
-// RowsToAny instead.
+// map, last value wins; string APIs always scan through []byte, so
+// for exact numeric values use RowsToAny instead.
 func RowsToMap(rows *sql.Rows) (dataRes map[int]map[string]string, err error) {
 	_, slice, err := stringRows(rows)
 	if err != nil {
@@ -170,7 +519,21 @@ func RowsToSlice(rows *sql.Rows) ([]map[string]string, error) {
 // RowsToAny returns typed row data: numbers, booleans and times keep
 // their types, and NULL becomes nil instead of an empty string, which
 // makes it suitable for JSON output or type checks. With no rows it
-// returns an empty, non-nil slice.
+// returns an empty, non-nil slice. Duplicate column names collapse
+// with last value wins. Where the driver returns a value as []byte
+// or string, the column's database type decides the Go type:
+// INT-like columns yield int64, FLOAT/DECIMAL-like columns yield
+// float64, BOOL columns yield bool, and DATE/DATETIME/TIMESTAMP
+// columns yield time.Time. Values the driver already typed are
+// normalized to the column kind (int to int64, integer to float64
+// for FLOAT columns, 0/1 to bool for BOOL columns). A value that
+// cannot be parsed for its column type falls back to its string
+// form. DECIMAL and NUMERIC become float64, so very large or
+// high-precision decimals may lose precision, and a NUMERIC column
+// holding an integer value also yields float64; TIME columns stay
+// strings. Time strings without a timezone are read as UTC, so
+// their JSON form carries a Z. An UNSIGNED BIGINT above the int64
+// range falls back to its string form.
 func RowsToAny(rows *sql.Rows) ([]map[string]any, error) {
 	return anyRows(rows)
 }
@@ -195,16 +558,63 @@ func RowsToJSON(rows *sql.Rows) (string, error) {
 	return string(b), nil
 }
 
+// WriteJSON streams rows to w as a JSON array, one row at a time,
+// without accumulating the whole result. Values follow the RowsToAny
+// rules, and an empty result writes "[]". Column information is
+// validated before anything is written, so a no-column query or a
+// ColumnTypes() error fails with no output at all. Unlike
+// RowsToJSON, a mid-stream read or encode error cannot take back
+// output already written, so the writer may be left with a partial
+// array; the error is still returned. It does not close rows.
+func WriteJSON(w io.Writer, rows *sql.Rows) error {
+	if w == nil {
+		return fmt.Errorf("gosqltool: nil writer")
+	}
+	if rows == nil {
+		return fmt.Errorf("gosqltool: nil rows")
+	}
+	if _, err := columnInfos(rows); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("[")); err != nil {
+		return fmt.Errorf("gosqltool: write: %w", err)
+	}
+	first := true
+	for row, err := range IterAny(rows) {
+		if err != nil {
+			return err
+		}
+		if !first {
+			if _, err := w.Write([]byte(",")); err != nil {
+				return fmt.Errorf("gosqltool: write: %w", err)
+			}
+		}
+		first = false
+		b, err := json.Marshal(row)
+		if err != nil {
+			return fmt.Errorf("gosqltool: json: %w", err)
+		}
+		if _, err := w.Write(b); err != nil {
+			return fmt.Errorf("gosqltool: write: %w", err)
+		}
+	}
+	if _, err := w.Write([]byte("]")); err != nil {
+		return fmt.Errorf("gosqltool: write: %w", err)
+	}
+	return nil
+}
+
 // sanitizeXMLName converts a column name into a valid XML element name.
 // XML names may start with a letter or "_" and may contain letters,
-// digits, "_", "-" and "."; letters include non-ASCII letters, so a
-// Chinese column name such as "姓名" is kept as-is. Characters outside
-// that set (spaces, "/", ":", "<" and so on) become underscores, a
-// leading digit, "-" or "." gets a "_" prefix, and an empty name
-// becomes "col". Note that two different names can still sanitize to
-// the same element name (for example "user name" and "user_name"); the
-// XML path preserves both in order, but a map keyed by element name
-// would collapse them.
+// ASCII digits, "_", "-" and "."; letters include non-ASCII letters,
+// so a Chinese column name such as "姓名" is kept as-is, while a
+// non-ASCII digit becomes "_" because XML 1.0 digits are ASCII only.
+// Characters outside that set (spaces, "/", ":", "<" and so on)
+// become underscores, a leading ASCII digit, "-" or "." gets a "_"
+// prefix, and an empty name becomes "col". Note that two different
+// names can still sanitize to the same element name (for example
+// "user name" and "user_name"); the XML path preserves both in
+// order, but a map keyed by element name would collapse them.
 func sanitizeXMLName(name string) string {
 	if name == "" {
 		return "col"
@@ -216,7 +626,7 @@ func sanitizeXMLName(name string) string {
 		switch {
 		case unicode.IsLetter(r) || r == '_':
 			b.WriteRune(r)
-		case unicode.IsDigit(r) || r == '-' || r == '.':
+		case (r >= '0' && r <= '9') || r == '-' || r == '.':
 			if first {
 				b.WriteByte('_')
 			}
@@ -229,6 +639,18 @@ func sanitizeXMLName(name string) string {
 		first = false
 	}
 	return b.String()
+}
+
+// xmlNames resolves empty table or row names to the defaults and
+// sanitizes both, shared by the collecting and streaming XML paths.
+func xmlNames(tableName, rowName string) (string, string) {
+	if tableName == "" {
+		tableName = defaultTableName
+	}
+	if rowName == "" {
+		rowName = defaultRowName
+	}
+	return sanitizeXMLName(tableName), sanitizeXMLName(rowName)
 }
 
 // RowsToXMLWithNames is the parameterized version of RowsToXML: it does
@@ -245,18 +667,11 @@ func RowsToXMLWithNames(rows *sql.Rows, tableName, rowName string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	if tableName == "" {
-		tableName = defaultTableName
-	}
-	if rowName == "" {
-		rowName = defaultRowName
-	}
-	tableName = sanitizeXMLName(tableName)
-	rowName = sanitizeXMLName(rowName)
+	tableName, rowName = xmlNames(tableName, rowName)
 
-	xml := etree.NewDocument()
-	xml.CreateProcInst("xml", `version="1.0" encoding="UTF-8"`)
-	rowData := xml.CreateElement(tableName)
+	xmlDoc := etree.NewDocument()
+	xmlDoc.CreateProcInst("xml", `version="1.0" encoding="UTF-8"`)
+	rowData := xmlDoc.CreateElement(tableName)
 	for rowCnt, cells := range cellRows {
 		rowElement := rowData.CreateElement(fmt.Sprintf("%s%d", rowName, rowCnt))
 		for _, cell := range cells {
@@ -264,8 +679,90 @@ func RowsToXMLWithNames(rows *sql.Rows, tableName, rowName string) (string, erro
 			colElement.CreateText(cell.value)
 		}
 	}
-	xml.Indent(2)
-	return xml.WriteToString()
+	xmlDoc.Indent(2)
+	return xmlDoc.WriteToString()
+}
+
+// WriteXML streams rows to w as XML, one row at a time, without
+// accumulating the whole result. Empty tableName or rowName fall back
+// to the defaults, not to the TableName / RowName globals, names are
+// sanitized as in RowsToXMLWithNames, and duplicate column names and
+// their order are preserved; downstream code that parses the XML
+// into a map will still collapse sanitized collisions, as noted for
+// sanitizeXMLName. Unlike RowsToXML, the output is indented by
+// encoding/xml rather than etree, so whitespace may differ while the
+// element structure is the same. Column names are validated before
+// anything is written, so a no-column query fails with no output at
+// all. A mid-stream read or encode error cannot take back output
+// already written, so the writer may be left with a partial
+// document; buffered tokens are flushed best-effort on error, and
+// the error is still returned. It does not close rows.
+func WriteXML(w io.Writer, rows *sql.Rows, tableName, rowName string) (err error) {
+	if w == nil {
+		return fmt.Errorf("gosqltool: nil writer")
+	}
+	if rows == nil {
+		return fmt.Errorf("gosqltool: nil rows")
+	}
+	if _, err := stringColumnNames(rows); err != nil {
+		return err
+	}
+	tableName, rowName = xmlNames(tableName, rowName)
+	if _, err := w.Write([]byte(xml.Header)); err != nil {
+		return fmt.Errorf("gosqltool: write: %w", err)
+	}
+	enc := xml.NewEncoder(w)
+	enc.Indent("", "  ")
+	// On a mid-stream error, flush best-effort so the partial
+	// document actually reaches the writer instead of staying in
+	// the encoder buffer; the original error is never masked.
+	defer func() {
+		if err != nil {
+			_ = enc.Flush()
+		}
+	}()
+	encode := func(tok xml.Token) error {
+		if err := enc.EncodeToken(tok); err != nil {
+			return fmt.Errorf("gosqltool: xml: %w", err)
+		}
+		return nil
+	}
+	if err := encode(xml.StartElement{Name: xml.Name{Local: tableName}}); err != nil {
+		return err
+	}
+	rowCnt := 0
+	for cells, err := range iterCells(rows) {
+		if err != nil {
+			return err
+		}
+		rowElem := fmt.Sprintf("%s%d", rowName, rowCnt)
+		rowCnt++
+		if err := encode(xml.StartElement{Name: xml.Name{Local: rowElem}}); err != nil {
+			return err
+		}
+		for _, cell := range cells {
+			colName := sanitizeXMLName(cell.name)
+			if err := encode(xml.StartElement{Name: xml.Name{Local: colName}}); err != nil {
+				return err
+			}
+			if err := encode(xml.CharData(cell.value)); err != nil {
+				return err
+			}
+			if err := encode(xml.EndElement{Name: xml.Name{Local: colName}}); err != nil {
+				return err
+			}
+		}
+		if err := encode(xml.EndElement{Name: xml.Name{Local: rowElem}}); err != nil {
+			return err
+		}
+	}
+	if err := encode(xml.EndElement{Name: xml.Name{Local: tableName}}); err != nil {
+		return err
+	}
+	if err := enc.Flush(); err != nil {
+		return fmt.Errorf("gosqltool: xml: %w", err)
+	}
+	return nil
 }
 
 // RowsToXML transfer sql res to xml

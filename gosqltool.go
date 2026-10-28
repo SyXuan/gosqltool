@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/beevik/etree"
 )
@@ -24,17 +25,25 @@ const (
 	defaultRowName   = "Row_"
 )
 
-// stringRows reads rows into an ordered slice of map[colName]value.
-// NULL becomes an empty string, matching the legacy RowsToMap behaviour;
-// use RowsToAny when NULL must stay distinguishable.
-func stringRows(rows *sql.Rows) ([]string, []map[string]string, error) {
+// stringCell is one column value in its original position. It exists so
+// the XML path can preserve duplicate column names and their order,
+// which a map cannot: map APIs collapse duplicates, last value wins.
+type stringCell struct {
+	name  string
+	value string
+}
+
+// scanStringCells reads rows into ordered per-row cells. NULL becomes an
+// empty string, matching the legacy RowsToMap behaviour; use RowsToAny
+// when NULL must stay distinguishable.
+func scanStringCells(rows *sql.Rows) ([]string, [][]stringCell, error) {
 	if rows == nil {
 		return nil, nil, fmt.Errorf("gosqltool: nil rows")
 	}
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("gosqltool: columns: %w", err)
 	}
 	if len(cols) == 0 {
 		return nil, nil, fmt.Errorf("gosqltool: query returned no columns")
@@ -46,20 +55,40 @@ func stringRows(rows *sql.Rows) ([]string, []map[string]string, error) {
 		dest[i] = &rawResult[i]
 	}
 
-	out := make([]map[string]string, 0)
+	out := make([][]stringCell, 0)
 	for rows.Next() {
-		rowMap := make(map[string]string, len(cols))
+		cells := make([]stringCell, len(cols))
 		if err := rows.Scan(dest...); err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("gosqltool: scan: %w", err)
 		}
 		for i, raw := range rawResult {
 			// A nil raw value means NULL; the legacy behaviour is an empty string.
-			rowMap[cols[i]] = string(raw)
+			cells[i] = stringCell{name: cols[i], value: string(raw)}
 		}
-		out = append(out, rowMap)
+		out = append(out, cells)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("gosqltool: rows: %w", err)
+	}
+	return cols, out, nil
+}
+
+// stringRows reads rows into an ordered slice of map[colName]value.
+// Duplicate column names collapse in a map, last value wins, exactly as
+// in the legacy implementation; use the XML path if duplicates must be
+// preserved in order.
+func stringRows(rows *sql.Rows) ([]string, []map[string]string, error) {
+	cols, cells, err := scanStringCells(rows)
+	if err != nil {
 		return nil, nil, err
+	}
+	out := make([]map[string]string, 0, len(cells))
+	for _, rowCells := range cells {
+		rowMap := make(map[string]string, len(rowCells))
+		for _, cell := range rowCells {
+			rowMap[cell.name] = cell.value
+		}
+		out = append(out, rowMap)
 	}
 	return cols, out, nil
 }
@@ -75,7 +104,7 @@ func anyRows(rows *sql.Rows) ([]map[string]any, error) {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gosqltool: columns: %w", err)
 	}
 	if len(cols) == 0 {
 		return nil, fmt.Errorf("gosqltool: query returned no columns")
@@ -90,7 +119,7 @@ func anyRows(rows *sql.Rows) ([]map[string]any, error) {
 	for rows.Next() {
 		rowMap := make(map[string]any, len(cols))
 		if err := rows.Scan(dest...); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("gosqltool: scan: %w", err)
 		}
 		for i, v := range vals {
 			if b, ok := v.([]byte); ok {
@@ -102,7 +131,7 @@ func anyRows(rows *sql.Rows) ([]map[string]any, error) {
 		out = append(out, rowMap)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gosqltool: rows: %w", err)
 	}
 	return out, nil
 }
@@ -110,7 +139,10 @@ func anyRows(rows *sql.Rows) ([]map[string]any, error) {
 // RowsToMap transfer sql res to map
 // dataMap[rowCnt]map[colName]value, with rowCnt numbered from 0.
 // On a read error it returns nil and the error, not a partial result.
-// NULL becomes an empty string.
+// NULL becomes an empty string. Duplicate column names collapse in the
+// map, last value wins; non-string driver values are converted through
+// database/sql's []byte conversion, so for exact numeric values use
+// RowsToAny instead.
 func RowsToMap(rows *sql.Rows) (dataRes map[int]map[string]string, err error) {
 	_, slice, err := stringRows(rows)
 	if err != nil {
@@ -148,7 +180,9 @@ func RowsToAny(rows *sql.Rows) ([]map[string]any, error) {
 //	[{"created":"2018-03-20T00:00:00Z","uid":1,"username":"Trump"}]
 //
 // Values follow the RowsToAny rules: numbers stay numbers, NULL is null,
-// and times are RFC3339. With no rows it returns "[]".
+// and times are RFC3339Nano. With no rows it returns "[]". A value that
+// JSON cannot encode (for example a NaN or infinite float) makes the
+// whole call return "" and an error instead of invalid JSON.
 func RowsToJSON(rows *sql.Rows) (string, error) {
 	slice, err := anyRows(rows)
 	if err != nil {
@@ -156,44 +190,58 @@ func RowsToJSON(rows *sql.Rows) (string, error) {
 	}
 	b, err := json.Marshal(slice)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("gosqltool: json: %w", err)
 	}
 	return string(b), nil
 }
 
-// sanitizeXMLName converts a column name into a valid XML element name:
-// illegal characters become underscores, a leading digit, "-" or "."
-// gets a "_" prefix, and an empty name becomes "col". Names that are
-// already valid are left unchanged.
+// sanitizeXMLName converts a column name into a valid XML element name.
+// XML names may start with a letter or "_" and may contain letters,
+// digits, "_", "-" and "."; letters include non-ASCII letters, so a
+// Chinese column name such as "姓名" is kept as-is. Characters outside
+// that set (spaces, "/", ":", "<" and so on) become underscores, a
+// leading digit, "-" or "." gets a "_" prefix, and an empty name
+// becomes "col". Note that two different names can still sanitize to
+// the same element name (for example "user name" and "user_name"); the
+// XML path preserves both in order, but a map keyed by element name
+// would collapse them.
 func sanitizeXMLName(name string) string {
 	if name == "" {
 		return "col"
 	}
 	var b strings.Builder
 	b.Grow(len(name))
-	for i, r := range name {
+	first := true
+	for _, r := range name {
 		switch {
-		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_':
+		case unicode.IsLetter(r) || r == '_':
 			b.WriteRune(r)
-		case r >= '0' && r <= '9' || r == '-' || r == '.':
-			if i == 0 {
+		case unicode.IsDigit(r) || r == '-' || r == '.':
+			if first {
 				b.WriteByte('_')
 			}
+			b.WriteRune(r)
+		case !first && (unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Mc, r)):
 			b.WriteRune(r)
 		default:
 			b.WriteByte('_')
 		}
+		first = false
 	}
 	return b.String()
 }
 
 // RowsToXMLWithNames is the parameterized version of RowsToXML: it does
 // not depend on the globals. Empty tableName or rowName fall back to the
-// defaults, and column names are passed through sanitizeXMLName first,
-// so names with spaces, non-ASCII characters or a leading digit do not
-// produce invalid XML.
+// defaults, and table, row and column names are passed through
+// sanitizeXMLName first, so names with spaces or a leading digit do not
+// produce invalid XML, while valid non-ASCII names are kept as-is.
+// Unlike the map APIs, this path preserves duplicate column names and
+// their order, matching the legacy streaming output. Values are escaped
+// by etree; characters outside the XML character range are rewritten by
+// etree rather than passed through verbatim.
 func RowsToXMLWithNames(rows *sql.Rows, tableName, rowName string) (string, error) {
-	cols, slice, err := stringRows(rows)
+	_, cellRows, err := scanStringCells(rows)
 	if err != nil {
 		return "", err
 	}
@@ -209,11 +257,11 @@ func RowsToXMLWithNames(rows *sql.Rows, tableName, rowName string) (string, erro
 	xml := etree.NewDocument()
 	xml.CreateProcInst("xml", `version="1.0" encoding="UTF-8"`)
 	rowData := xml.CreateElement(tableName)
-	for rowCnt, rowMap := range slice {
+	for rowCnt, cells := range cellRows {
 		rowElement := rowData.CreateElement(fmt.Sprintf("%s%d", rowName, rowCnt))
-		for _, col := range cols {
-			colElement := rowElement.CreateElement(sanitizeXMLName(col))
-			colElement.CreateText(rowMap[col])
+		for _, cell := range cells {
+			colElement := rowElement.CreateElement(sanitizeXMLName(cell.name))
+			colElement.CreateText(cell.value)
 		}
 	}
 	xml.Indent(2)

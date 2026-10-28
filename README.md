@@ -25,7 +25,7 @@ Requires Go 1.23 or later.
 | `IterString(rows)` | `iter.Seq2[map[string]string, error]` | Streams one string row at a time, same values as `RowsToSlice`. |
 | `ForEachAny(rows, fn)` / `ForEachString(rows, fn)` | `error` | Calls `fn` once per row and stops at the first error from `fn` or from iteration. |
 | `WriteJSON(w, rows)` | `error` | Streams rows to `w` as a JSON array, one row at a time. Empty result writes `"[]"`. |
-| `WriteXML(w, rows, table, row)` | `error` | Streams rows to `w` as XML, one row at a time, preserving duplicate column names and order. Empty names fall back to the defaults. |
+| `WriteXML(w, rows, table, row)` | `error` | Streams rows to `w` as XML, one row at a time, preserving duplicate column names and order. Empty names fall back to the defaults, not to the `TableName` / `RowName` globals. |
 
 On any read error, the functions return `nil` / `""` plus the error
 (including errors reported by `rows.Err()` after iteration) instead of
@@ -37,6 +37,7 @@ The collecting APIs above load the whole result into memory. For a
 large result, iterate or write one row at a time instead:
 
 ```go
+defer rows.Close()
 for row, err := range gosqltool.IterAny(rows) {
     if err != nil {
         checkErr(err)
@@ -55,10 +56,15 @@ checkErr(err)
 
 Streaming APIs do not close `rows`: the caller still owns it and
 must close it, exactly as with the collecting APIs. Breaking out of
-an iterator early simply stops iteration, with no error. Unlike the
-collecting APIs, `WriteJSON` / `WriteXML` cannot take back output
-already written, so a mid-stream read or encode error leaves a
-partial array or document in the writer; the error is still returned.
+an iterator early simply stops iteration, with no error. An iterator
+is single-pass: ranging it again continues from where the previous
+range stopped, it does not restart, and two iterators must not be
+used on the same `rows` concurrently. Column names are validated
+before `WriteJSON` / `WriteXML` write anything, so a no-column query
+fails with no output at all. Unlike the collecting APIs, a mid-stream
+read or encode error cannot take back output already written, so the
+writer may be left with a partial array or document; the error is
+still returned.
 
 ## Typed conversion
 
@@ -72,13 +78,29 @@ spellings:
 - BOOL / BOOLEAN yield `bool`
 - DATE / DATETIME / TIMESTAMP yield `time.Time`
 
-Values the driver already typed pass through unchanged. A value that
-cannot be parsed for its column type falls back to its string form
-instead of failing the row. DECIMAL and NUMERIC become `float64`, so
-very large or high-precision decimals may lose precision. TIME
-columns stay strings, because a time of day has no date to put into
-a `time.Time`. Columns whose type the driver does not report keep
-the previous behaviour (`[]byte` becomes a string).
+Values the driver already typed are normalized to the column kind:
+`int` becomes `int64` for INT columns, an integer becomes `float64`
+for FLOAT columns, and `0` / `1` become `bool` for BOOL columns. A
+value that cannot be parsed for its column type falls back to its
+string form instead of failing the row; this also covers `"NaN"` and
+`"Inf"` strings in a FLOAT column, which stay strings instead of
+making the whole JSON call fail, and an UNSIGNED BIGINT above the
+`int64` range, which also falls back to its string form. DECIMAL and
+NUMERIC become `float64`, so very large or high-precision decimals
+may lose precision, and a NUMERIC column holding an integer value
+also yields `float64`. MONEY yields `float64` only when the driver
+returns a plain number; a formatted value such as `"$1,234.00"`
+fails to parse and falls back to its string form. TIME columns stay
+strings, because a time of day has no date to put into a `time.Time`.
+Time strings without a timezone are read as UTC, so their JSON form
+carries a `Z`. Columns whose type the driver does not report keep
+the previous behaviour (`[]byte` becomes a string). Two driver
+quirks to know: MySQL `BOOL` is really `TINYINT(1)`, so a MySQL BOOL
+column yields `int64`, not `bool`, and MySQL `TINYINT(1)` in general
+is treated as INT; `UNSIGNED INT` / `UNSIGNED BIGINT` (and SQLite's
+`UNSIGNED BIG INT`) are treated as INT. The string APIs
+(`RowsToMap` / `RowsToSlice` / `RowsToXML`) do not use column types
+at all, so a driver whose `ColumnTypes()` fails does not break them.
 
 ## Example
 
@@ -197,9 +219,14 @@ set them once at startup if you use them, or prefer
   yielded `"42"`). They now convert it using the column's database
   type, so the same column yields `int64(42)`. This is the intended
   fix, but it changes output for drivers that return numbers, bools
-  or times as `[]byte` or strings. Columns with no reported type,
-  unparsable values (which fall back to strings), and values the
-  driver already typed are unchanged.
+  or times as `[]byte` or strings. Values the driver already typed
+  are also normalized to the column kind (see Typed conversion).
+  Columns with no reported type and unparsable values (which fall
+  back to strings) are unchanged, except that `"NaN"` / `"Inf"`
+  strings in a FLOAT column stay strings instead of failing JSON.
+  Time strings without a timezone are read as UTC. The string APIs
+  (`RowsToMap` / `RowsToSlice` / `RowsToXML`) are unchanged and do
+  not depend on `ColumnTypes()`.
 - The module path is now `github.com/SyXuan/gosqltool` (capital `S`/`X`,
   matching the repository). The old README showed a lowercase path.
 - `RowsToMap` and `RowsToXML` keep their original signatures and, for

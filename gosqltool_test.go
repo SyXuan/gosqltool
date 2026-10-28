@@ -339,6 +339,13 @@ func TestNilRowsAndEmptyResult(t *testing.T) {
 		t.Fatal("RowsToAny(nil): want error")
 	}
 
+	if slice, err := RowsToSlice(nil); err == nil || slice != nil {
+		t.Fatalf("RowsToSlice(nil) = %#v, %v; want nil slice and error", slice, err)
+	}
+	if any, err := RowsToAny(nil); err == nil || any != nil {
+		t.Fatalf("RowsToAny(nil) = %#v, %v; want nil slice and error", any, err)
+	}
+
 	rows := openRows(t, []string{"uid"}, nil)
 	slice, err := RowsToSlice(rows)
 	if err != nil {
@@ -365,6 +372,8 @@ func TestSanitizeXMLName(t *testing.T) {
 		"姓名":        "姓名",
 		"café":      "café",
 		"a:b":       "a_b",
+		"٣abc":      "_abc",
+		"a３b":       "a_b",
 	}
 	for in, want := range cases {
 		if got := sanitizeXMLName(in); got != want {
@@ -416,8 +425,14 @@ func TestRowsToAnyPostgresTypeNames(t *testing.T) {
 		t.Fatalf("RowsToAny: %v", err)
 	}
 	row := got[0]
-	if row["id"] != int64(7) || row["amount"] != float64(2.25) || row["ok"] != false {
-		t.Fatalf("row = %#v", row)
+	if row["id"] != int64(7) {
+		t.Fatalf("id = %#v, want int64 7", row["id"])
+	}
+	if row["amount"] != float64(2.25) {
+		t.Fatalf("amount = %#v, want float64 2.25", row["amount"])
+	}
+	if row["ok"] != false {
+		t.Fatalf("ok = %#v, want bool false", row["ok"])
 	}
 	if row["at"] != time.Date(2018, 3, 20, 0, 0, 0, 0, time.UTC) {
 		t.Fatalf("at = %#v", row["at"])
@@ -475,6 +490,9 @@ func TestIterAnyPropagatesError(t *testing.T) {
 	if iterErr == nil {
 		t.Fatal("IterAny: want error, got nil")
 	}
+	if !errors.Is(iterErr, boom) {
+		t.Fatalf("IterAny err = %v, want errors.Is boom", iterErr)
+	}
 	if count != 1 {
 		t.Fatalf("count = %d, want 1 row before the error", count)
 	}
@@ -530,8 +548,12 @@ func TestWriteJSONStreams(t *testing.T) {
 	if err := json.Unmarshal([]byte(buf.String()), &decoded); err != nil {
 		t.Fatalf("WriteJSON output %q does not decode: %v", buf.String(), err)
 	}
-	if len(decoded) != 2 || decoded[0]["uid"] != float64(1) || decoded[1]["username"] != "x" {
-		t.Fatalf("decoded = %#v", decoded)
+	want := []map[string]any{
+		{"uid": float64(1), "username": "Trump"},
+		{"uid": float64(2), "username": "x"},
+	}
+	if !reflect.DeepEqual(decoded, want) {
+		t.Fatalf("decoded = %#v, want %#v", decoded, want)
 	}
 
 	empty := openRows(t, []string{"uid"}, nil)
@@ -560,17 +582,23 @@ func TestWriteXMLStreams(t *testing.T) {
 		t.Fatalf("WriteXML: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{`<?xml version="1.0" encoding="UTF-8"?>`, "<Table>", "<Row0>", "<uid>1</uid>", "<Row1>", "</Table>"} {
+	for _, want := range []string{`<?xml version="1.0" encoding="UTF-8"?>`, "<Table>", "<Row0>", "<uid>1</uid>", "<username>Trump</username>", "<Row1>", "<uid>2</uid>", "<username>x</username>", "</Table>"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("WriteXML output %q does not contain %q", out, want)
 		}
 	}
 
 	// Duplicate columns must survive streaming XML, as in RowsToXML.
+	// Empty names here also prove the RowData / Row_ defaults.
 	dup := openRows(t, []string{"a", "a"}, [][]driver.Value{{[]byte("1"), []byte("2")}})
 	buf.Reset()
 	if err := WriteXML(&buf, dup, "", ""); err != nil {
 		t.Fatalf("WriteXML duplicates: %v", err)
+	}
+	for _, want := range []string{"<RowData>", "<Row_0>"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("WriteXML defaults output %q does not contain %q", buf.String(), want)
+		}
 	}
 	first := strings.Index(buf.String(), "<a>1</a>")
 	second := strings.Index(buf.String(), "<a>2</a>")
@@ -583,5 +611,277 @@ func TestWriteXMLStreams(t *testing.T) {
 	}
 	if err := WriteXML(&buf, nil, "", ""); err == nil {
 		t.Fatal("WriteXML(nil rows): want error")
+	}
+}
+
+func TestRowsToAnyNormalizesDriverTypedValues(t *testing.T) {
+	// Documented normalization: a value the driver already typed is
+	// still normalized to the column kind, not passed through verbatim.
+	rows := openRowsWithTypes(t,
+		[]string{"i", "f", "b"},
+		[]string{"INT", "DECIMAL", "BOOLEAN"},
+		[][]driver.Value{{float64(42), int64(3), int64(1)}})
+	got, err := RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny: %v", err)
+	}
+	row := got[0]
+	if row["i"] != int64(42) {
+		t.Fatalf("i = %#v (%T), want int64 42", row["i"], row["i"])
+	}
+	if row["f"] != float64(3) {
+		t.Fatalf("f = %#v (%T), want float64 3", row["f"], row["f"])
+	}
+	if row["b"] != true {
+		t.Fatalf("b = %#v (%T), want bool true", row["b"], row["b"])
+	}
+}
+
+func TestRowsToAnyUnsignedTypes(t *testing.T) {
+	rows := openRowsWithTypes(t,
+		[]string{"a", "b", "c"},
+		[]string{"UNSIGNED INT", "UNSIGNED BIGINT", "UNSIGNED BIG INT"},
+		[][]driver.Value{{[]byte("7"), []byte("42"), []byte("9")}})
+	got, err := RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny: %v", err)
+	}
+	row := got[0]
+	if row["a"] != int64(7) || row["b"] != int64(42) || row["c"] != int64(9) {
+		t.Fatalf("row = %#v, want int64 7/42/9", row)
+	}
+
+	// INT UNSIGNED is the suffix spelling of the same modifier.
+	rows = openRowsWithTypes(t,
+		[]string{"a"},
+		[]string{"INT UNSIGNED"},
+		[][]driver.Value{{[]byte("11")}})
+	got, err = RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny suffix: %v", err)
+	}
+	if got[0]["a"] != int64(11) {
+		t.Fatalf("a = %#v, want int64 11", got[0]["a"])
+	}
+
+	// Above the int64 range, ParseInt fails and the value falls back
+	// to its string form, preserving the value instead of erroring.
+	rows = openRowsWithTypes(t,
+		[]string{"huge"},
+		[]string{"UNSIGNED BIGINT"},
+		[][]driver.Value{{[]byte("18446744073709551615")}})
+	got, err = RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny overflow: %v", err)
+	}
+	if got[0]["huge"] != "18446744073709551615" {
+		t.Fatalf("huge = %#v, want fallback string", got[0]["huge"])
+	}
+}
+
+func TestRowsToAnyNaNAndInfFallbackToString(t *testing.T) {
+	rows := openRowsWithTypes(t,
+		[]string{"x", "y", "z"},
+		[]string{"DECIMAL", "DECIMAL", "DECIMAL"},
+		[][]driver.Value{{[]byte("NaN"), []byte("Inf"), []byte("-Inf")}})
+	got, err := RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny: %v", err)
+	}
+	if got[0]["x"] != "NaN" || got[0]["y"] != "Inf" || got[0]["z"] != "-Inf" {
+		t.Fatalf("row = %#v, want NaN/Inf/-Inf strings", got[0])
+	}
+
+	// The same values must not make RowsToJSON fail the whole call.
+	rows = openRowsWithTypes(t,
+		[]string{"x"},
+		[]string{"DECIMAL"},
+		[][]driver.Value{{[]byte("NaN")}})
+	out, err := RowsToJSON(rows)
+	if err != nil {
+		t.Fatalf("RowsToJSON NaN: %v", err)
+	}
+	if out != `[{"x":"NaN"}]` {
+		t.Fatalf("RowsToJSON = %q, want [{\"x\":\"NaN\"}]", out)
+	}
+}
+
+func TestRowsToAnyTimeWithoutTimezoneAndUnknownType(t *testing.T) {
+	rows := openRowsWithTypes(t,
+		[]string{"t", "u", "v", "w"},
+		[]string{"TIME", "", "FOO", "TIMESTAMP"},
+		[][]driver.Value{{[]byte("12:34:56"), []byte("42"), []byte("42"), []byte("2018-03-20T00:00:00+0000")}})
+	got, err := RowsToAny(rows)
+	if err != nil {
+		t.Fatalf("RowsToAny: %v", err)
+	}
+	row := got[0]
+	if row["t"] != "12:34:56" {
+		t.Fatalf("TIME t = %#v, want string \"12:34:56\"", row["t"])
+	}
+	if row["u"] != "42" {
+		t.Fatalf("unknown-type u = %#v, want string \"42\"", row["u"])
+	}
+	if row["v"] != "42" {
+		t.Fatalf("unknown-type v = %#v, want string \"42\"", row["v"])
+	}
+	// time.Parse with a numeric +0000 offset yields a fixed zone with
+	// an empty name, not time.UTC, so compare instants, not ==.
+	wt, ok := row["w"].(time.Time)
+	if !ok || !wt.Equal(time.Date(2018, 3, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("w = %#v, want instant 2018-03-20 UTC (no-colon offset layout)", row["w"])
+	}
+}
+
+func TestIterString(t *testing.T) {
+	rows := openRows(t,
+		[]string{"n"},
+		[][]driver.Value{{[]byte("a")}, {[]byte("b")}, {[]byte("c")}})
+	var got []string
+	for row, err := range IterString(rows) {
+		if err != nil {
+			t.Fatalf("IterString: %v", err)
+		}
+		got = append(got, row["n"])
+		if len(got) == 1 {
+			break
+		}
+	}
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("early break got %#v, want [a]", got)
+	}
+
+	// Nil rows yield one error, empty result yields zero rows and no error.
+	var iterErr error
+	for _, err := range IterString(nil) {
+		iterErr = err
+	}
+	if iterErr == nil {
+		t.Fatal("IterString(nil): want error")
+	}
+	empty := openRows(t, []string{"n"}, nil)
+	var count int
+	for _, err := range IterString(empty) {
+		if err != nil {
+			t.Fatalf("IterString empty: %v", err)
+		}
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("IterString empty count = %d, want 0", count)
+	}
+
+	// Mid-stream error: one row, then the error, with errors.Is intact.
+	boom := errors.New("boom")
+	errRows := openRowsWithErr(t,
+		[]string{"uid"},
+		[][]driver.Value{{[]byte("1")}, {[]byte("2")}},
+		1, boom)
+	count = 0
+	iterErr = nil
+	for _, err := range IterString(errRows) {
+		if err != nil {
+			iterErr = err
+			break
+		}
+		count++
+	}
+	if !errors.Is(iterErr, boom) {
+		t.Fatalf("IterString err = %v, want errors.Is boom", iterErr)
+	}
+	if count != 1 {
+		t.Fatalf("IterString count = %d, want 1 row before the error", count)
+	}
+}
+
+func TestStreamingWritersAndForEachMidStreamError(t *testing.T) {
+	boom := errors.New("boom")
+	mk := func() *sql.Rows {
+		return openRowsWithErr(t,
+			[]string{"uid"},
+			[][]driver.Value{{[]byte("1")}, {[]byte("2")}},
+			1, boom)
+	}
+
+	var buf strings.Builder
+	if err := WriteJSON(&buf, mk()); !errors.Is(err, boom) {
+		t.Fatalf("WriteJSON mid-stream err = %v, want errors.Is boom", err)
+	}
+	if !strings.HasPrefix(buf.String(), "[") || strings.HasSuffix(buf.String(), "]") {
+		t.Fatalf("WriteJSON partial output = %q, want a partial array without closing ]", buf.String())
+	}
+
+	buf.Reset()
+	if err := WriteXML(&buf, mk(), "Table", "Row"); !errors.Is(err, boom) {
+		t.Fatalf("WriteXML mid-stream err = %v, want errors.Is boom", err)
+	}
+	if !strings.Contains(buf.String(), "<Row0>") || strings.Contains(buf.String(), "</Table>") {
+		t.Fatalf("WriteXML partial output = %q, want first row but no closing table", buf.String())
+	}
+
+	if err := ForEachAny(mk(), func(map[string]any) error { return nil }); !errors.Is(err, boom) {
+		t.Fatalf("ForEachAny mid-stream err = %v, want errors.Is boom", err)
+	}
+	if err := ForEachString(mk(), func(map[string]string) error { return nil }); !errors.Is(err, boom) {
+		t.Fatalf("ForEachString mid-stream err = %v, want errors.Is boom", err)
+	}
+}
+
+func TestStreamingWritersNoColumnFailsWithNoOutput(t *testing.T) {
+	var buf strings.Builder
+	rows := openRows(t, []string{}, nil)
+	if err := WriteJSON(&buf, rows); err == nil {
+		t.Fatal("WriteJSON no-column: want error")
+	}
+	if buf.String() != "" {
+		t.Fatalf("WriteJSON no-column output = %q, want empty (pre-validation)", buf.String())
+	}
+
+	buf.Reset()
+	rows = openRows(t, []string{}, nil)
+	if err := WriteXML(&buf, rows, "Table", "Row"); err == nil {
+		t.Fatal("WriteXML no-column: want error")
+	}
+	if buf.String() != "" {
+		t.Fatalf("WriteXML no-column output = %q, want empty (pre-validation)", buf.String())
+	}
+
+	// Empty results on the iterators and ForEach: zero rows, no error.
+	empty := openRows(t, []string{"n"}, nil)
+	var count int
+	for _, err := range IterAny(empty) {
+		if err != nil {
+			t.Fatalf("IterAny empty: %v", err)
+		}
+		count++
+	}
+	if count != 0 {
+		t.Fatalf("IterAny empty count = %d, want 0", count)
+	}
+	empty = openRows(t, []string{"n"}, nil)
+	if err := ForEachAny(empty, func(map[string]any) error { return nil }); err != nil {
+		t.Fatalf("ForEachAny empty: %v", err)
+	}
+}
+
+func TestWriteXMLDefaultNames(t *testing.T) {
+	rows := openRows(t, []string{"uid"}, [][]driver.Value{{[]byte("1")}})
+	var buf strings.Builder
+	if err := WriteXML(&buf, rows, "", ""); err != nil {
+		t.Fatalf("WriteXML: %v", err)
+	}
+	if !strings.Contains(buf.String(), "<RowData>") || !strings.Contains(buf.String(), "<Row_0>") {
+		t.Fatalf("WriteXML defaults = %q, want <RowData> and <Row_0>", buf.String())
+	}
+}
+
+func TestForEachNilFunc(t *testing.T) {
+	rows := openRows(t, []string{"n"}, [][]driver.Value{{[]byte("a")}})
+	if err := ForEachAny(rows, nil); err == nil {
+		t.Fatal("ForEachAny(nil fn): want error, got nil (must not panic)")
+	}
+	rows = openRows(t, []string{"n"}, [][]driver.Value{{[]byte("a")}})
+	if err := ForEachString(rows, nil); err == nil {
+		t.Fatal("ForEachString(nil fn): want error, got nil (must not panic)")
 	}
 }
